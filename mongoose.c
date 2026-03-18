@@ -10391,21 +10391,26 @@ struct mg_connection *mg_sntp_connect(struct mg_mgr *mgr, const char *url,
 
 union usa {
   struct sockaddr sa;
+#if MG_ENABLE_IPV4
   struct sockaddr_in sin;
+#endif
 #if MG_ENABLE_IPV6
   struct sockaddr_in6 sin6;
 #endif
 };
 
 static socklen_t tousa(struct mg_addr *a, union usa *usa) {
-  socklen_t len = sizeof(usa->sin);
+  socklen_t len = 0;
   memset(usa, 0, sizeof(*usa));
+#if MG_ENABLE_IPV4
+  len = sizeof(usa->sin);
   usa->sin.sin_family = AF_INET;
   usa->sin.sin_port = a->port;
   memcpy(&usa->sin.sin_addr, a->addr.ip, sizeof(uint32_t));
+#endif
 #if MG_ENABLE_IPV6
   if (a->is_ip6) {
-    usa->sin.sin_family = AF_INET6;
+    usa->sin6.sin6_family = AF_INET6;
     usa->sin6.sin6_port = a->port;
     usa->sin6.sin6_scope_id = a->scope_id;
     memcpy(&usa->sin6.sin6_addr, a->addr.ip, sizeof(a->addr.ip));
@@ -10417,8 +10422,10 @@ static socklen_t tousa(struct mg_addr *a, union usa *usa) {
 
 static void tomgaddr(union usa *usa, struct mg_addr *a, bool is_ip6) {
   a->is_ip6 = is_ip6;
+#if MG_ENABLE_IPV4
   a->port = usa->sin.sin_port;
   memcpy(&a->addr.ip, &usa->sin.sin_addr, sizeof(uint32_t));
+#endif
 #if MG_ENABLE_IPV6
   if (is_ip6) {
     memcpy(a->addr.ip, &usa->sin6.sin6_addr, sizeof(a->addr.ip));
@@ -10432,7 +10439,11 @@ static void setlocaddr(MG_SOCKET_TYPE fd, struct mg_addr *addr) {
   union usa usa;
   socklen_t n = sizeof(usa);
   if (getsockname(fd, &usa.sa, &n) == 0) {
+    #if MG_ENABLE_IPV4
     tomgaddr(&usa, addr, n != sizeof(usa.sin));
+    #else
+    tomgaddr(&usa, addr, true);
+    #endif
   }
 }
 
@@ -10539,11 +10550,15 @@ void mg_multicast_add(struct mg_connection *c, char *ip) {
 #if defined(__ZEPHYR__) && ZEPHYR_VERSION_CODE < 0x40000
   MG_ERROR(("struct ip_mreq not defined"));
 #else
+#if MG_ENABLE_IPV4
   struct ip_mreq mreq;
   mreq.imr_multiaddr.s_addr = inet_addr(ip);
   mreq.imr_interface.s_addr = mg_htonl(INADDR_ANY);
   setsockopt(FD(c), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *) &mreq,
              sizeof(mreq));
+#else
+  MG_ERROR(("IPv4 is disabled, mg_multicast_add expects IPv4"));
+#endif
 #endif  // !Zephyr
 #endif  // !lwIP
 #endif
@@ -10558,7 +10573,11 @@ bool mg_open_listener(struct mg_connection *c, const char *url) {
   } else {
     union usa usa;
     socklen_t slen = tousa(&c->loc, &usa);
+#if MG_ENABLE_IPV4
     int rc, on = 1, af = c->loc.is_ip6 ? AF_INET6 : AF_INET;
+#else
+    int rc, on = 1, af = AF_INET6;
+#endif
     int type = strncmp(url, "udp:", 4) == 0 ? SOCK_DGRAM : SOCK_STREAM;
     int proto = type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP;
     (void) on;
@@ -10617,7 +10636,11 @@ static long recv_raw(struct mg_connection *c, void *buf, size_t len) {
     union usa usa;
     socklen_t slen = tousa(&c->rem, &usa);
     n = recvfrom(FD(c), (char *) buf, len, 0, &usa.sa, &slen);
+#if MG_ENABLE_IPV4
     if (n > 0) tomgaddr(&usa, &c->rem, slen != sizeof(usa.sin));
+#else
+    if (n > 0) tomgaddr(&usa, &c->rem, true);
+#endif
   } else {
     n = recv(FD(c), (char *) buf, len, MSG_NONBLOCKING);
   }
@@ -10742,7 +10765,11 @@ static void setsockopts(struct mg_connection *c) {
 void mg_connect_resolved(struct mg_connection *c) {
   int type = c->is_udp ? SOCK_DGRAM : SOCK_STREAM;
   int proto = type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP;
+#if MG_ENABLE_IPV4
   int rc, af = c->rem.is_ip6 ? AF_INET6 : AF_INET;  // c->rem has resolved IP
+#else
+  int rc, af = AF_INET6;
+#endif
   c->fd = S2PTR(socket(af, type, proto));           // Create outbound socket
   c->is_resolving = 0;                              // Clear resolving flag
   if (FD(c) == MG_INVALID_SOCKET) {
@@ -10812,7 +10839,11 @@ static void accept_conn(struct mg_mgr *mgr, struct mg_connection *lsn) {
     MG_ERROR(("%lu OOM", lsn->id));
     closesocket(fd);
   } else {
+#if MG_ENABLE_IPV4
     tomgaddr(&usa, &c->rem, sa_len != sizeof(usa.sin));
+#else
+    tomgaddr(&usa, &c->rem, true);
+#endif
     LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
     c->fd = S2PTR(fd);
     MG_EPOLL_ADD(c);
@@ -10985,6 +11016,7 @@ static void mg_iotest(struct mg_mgr *mgr, int ms) {
 #endif
 }
 
+#if MG_ENABLE_IPV4
 static bool mg_socketpair(MG_SOCKET_TYPE sp[2], union usa usa[2]) {
   socklen_t n = sizeof(usa[0].sin);
   bool success = false;
@@ -11012,6 +11044,37 @@ static bool mg_socketpair(MG_SOCKET_TYPE sp[2], union usa usa[2]) {
   }
   return success;
 }
+#endif
+
+#if MG_ENABLE_IPV6 && !MG_ENABLE_IPV4
+static bool mg_socketpair6(MG_SOCKET_TYPE sp[2], union usa usa[2]){
+  socklen_t n = sizeof(usa[0].sin6);
+  bool success = false;
+
+  sp[0] = sp[1] = MG_INVALID_SOCKET;
+  (void) memset(&usa[0], 0, sizeof(usa[0]));
+  usa[0].sin6.sin6_family = AF_INET6;
+  ((uint8_t *) &usa[0].sin6.sin6_addr)[15] = 1;  // ::1
+  usa[1] = usa[0];
+
+  if ((sp[0] = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)) != MG_INVALID_SOCKET &&
+      (sp[1] = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)) != MG_INVALID_SOCKET &&
+      bind(sp[0], &usa[0].sa, n) == 0 &&          //
+      bind(sp[1], &usa[1].sa, n) == 0 &&          //
+      getsockname(sp[0], &usa[0].sa, &n) == 0 &&  //
+      getsockname(sp[1], &usa[1].sa, &n) == 0 &&  //
+      connect(sp[0], &usa[1].sa, n) == 0 &&       //
+      connect(sp[1], &usa[0].sa, n) == 0) {       //
+    success = true;
+  }
+  if (!success) {
+    if (sp[0] != MG_INVALID_SOCKET) closesocket(sp[0]);
+    if (sp[1] != MG_INVALID_SOCKET) closesocket(sp[1]);
+    sp[0] = sp[1] = MG_INVALID_SOCKET;
+  }
+  return success;
+}
+#endif
 
 // mg_wakeup() event handler
 static void wufn(struct mg_connection *c, int ev, void *ev_data) {
@@ -11043,14 +11106,22 @@ bool mg_wakeup_init(struct mg_mgr *mgr) {
     union usa usa[2];
     MG_SOCKET_TYPE sp[2] = {MG_INVALID_SOCKET, MG_INVALID_SOCKET};
     struct mg_connection *c = NULL;
+#if MG_ENABLE_IPV4
     if (!mg_socketpair(sp, usa)) {
+#else
+    if (!mg_socketpair6(sp, usa)) {
+#endif
       MG_ERROR(("Cannot create socket pair"));
     } else if ((c = mg_wrapfd(mgr, (int) sp[1], wufn, NULL)) == NULL) {
       closesocket(sp[0]);
       closesocket(sp[1]);
       sp[0] = sp[1] = MG_INVALID_SOCKET;
     } else {
+#if MG_ENABLE_IPV4
       tomgaddr(&usa[0], &c->rem, false);
+#else
+      tomgaddr(&usa[0], &c->rem, true);
+#endif
       MG_DEBUG(("%lu %p pipe %lu", c->id, c->fd, (unsigned long) sp[0]));
       mgr->pipe = sp[0];
       ok = true;
