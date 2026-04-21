@@ -60,15 +60,28 @@ static double mg_atod(const char *p, int len, int *numlen) {
 
   // Exponential
   if (i < len && (p[i] == 'e' || p[i] == 'E')) {
-    int j, exp = 0, minus = 0;
+    int exp = 0, minus = 0;
     i++;
     if (i < len && p[i] == '-') minus = 1, i++;
     if (i < len && p[i] == '+') i++;
     while (i < len && p[i] >= '0' && p[i] <= '9' && exp < 308)
       exp = exp * 10 + (p[i++] - '0');
-    if (minus) exp = -exp;
-    for (j = 0; j < exp; j++) d *= 10.0;
-    for (j = 0; j < -exp; j++) d /= 10.0;
+    // use fast exponentiation
+    // https://en.wikipedia.org/wiki/Exponentiation_by_squaring
+    if (exp != 0) {
+      double x = 10, y = 1;
+      if (exp > 308) exp = 308;
+      if (minus) x = 0.1;
+      while (exp > 1) {
+        if (exp & 1) {
+          y *= x;
+          --exp;
+        }
+        x *= x;
+        exp >>= 1;
+      }
+      d *= x * y;
+    }
   }
 
   if (numlen != NULL) *numlen = i;
@@ -292,38 +305,42 @@ bool mg_json_get_bool(struct mg_str json, const char *path, bool *v) {
   return found;
 }
 
-bool mg_json_unescape(struct mg_str s, char *to, size_t n) {
-  size_t i, j;
-  for (i = 0, j = 0; i < s.len && j < n; i++, j++) {
-    if (s.buf[i] == '\\' && i + 5 < s.len && s.buf[i + 1] == 'u') {
-      //  \uXXXX escape. We process simple one-byte chars \u00xx within ASCII
-      //  range. More complex chars would require dragging in a UTF8 library,
-      //  which is too much for us
-      if (mg_str_to_num(mg_str_n(s.buf + i + 2, 4), 16, &to[j],
-                        sizeof(uint8_t)) == false)
-        return false;
-      i += 5;
-    } else if (s.buf[i] == '\\' && i + 1 < s.len) {
-      char c = json_esc(s.buf[i + 1], 0);
-      if (c == 0) return false;
-      to[j] = c;
-      i++;
-    } else {
-      to[j] = s.buf[i];
+size_t mg_json_unescape(struct mg_str json, const char *path, char *to,
+                        size_t n) {
+  struct mg_str s = mg_json_get_tok(json, path);
+  size_t res = 0, i, j;
+  if (s.len > 1 && s.buf[0] == '"') {  // Is is a string?
+    s.len -= 2, s.buf++;               // Trim surrounding double-quotes
+    for (i = 0, j = 0; i < s.len && j < n; i++, j++) {
+      if (s.buf[i] == '\\' && i + 5 < s.len && s.buf[i + 1] == 'u') {
+        //  \uXXXX escape. We process simple one-byte chars \u00xx within ASCII
+        //  range. More complex chars would require dragging in a UTF8 library,
+        //  which is too much for us
+        if (mg_str_to_num(mg_str_n(s.buf + i + 2, 4), 16, &to[j],
+                          sizeof(uint8_t)) == false)
+          break;
+        i += 5;
+      } else if (s.buf[i] == '\\' && i + 1 < s.len) {
+        char c = json_esc(s.buf[i + 1], 0);
+        if (c == 0) return false;
+        to[j] = c;
+        i++;
+      } else {
+        to[j] = s.buf[i];
+      }
     }
+    if (j < n) res = j;
+    if (n > 0) to[j < n ? j : n - 1] = '\0';
   }
-  if (j >= n) return false;
-  if (n > 0) to[j] = '\0';
-  return true;
+  return res;
 }
 
 char *mg_json_get_str(struct mg_str json, const char *path) {
   char *result = NULL;
   int len = 0, off = mg_json_get(json, path, &len);
-  if (off >= 0 && len > 1 && json.buf[off] == '"') {
+  if (off >= 0 && len > 2 && json.buf[off] == '"') {
     if ((result = (char *) mg_calloc(1, (size_t) len)) != NULL &&
-        !mg_json_unescape(mg_str_n(json.buf + off + 1, (size_t) (len - 2)),
-                          result, (size_t) len)) {
+        mg_json_unescape(json, path, result, (size_t) len) == 0) {
       mg_free(result);
       result = NULL;
     }
